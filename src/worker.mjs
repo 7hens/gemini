@@ -158,7 +158,8 @@ async function handleCompletions (req, apiKey) {
       model = DEFAULT_MODEL;
   }
   let isV3 = model.startsWith("gemini-3");
-  let body = await transformRequest(req, isV3);
+  const enumTypes = {};
+  let body = await transformRequest(req, isV3, enumTypes);
   const extra = req.extra_body?.google;
   if (extra) {
     if (extra.safety_settings) {
@@ -206,6 +207,7 @@ async function handleCompletions (req, apiKey) {
           flush: toOpenAiStreamFlush,
           streamIncludeUsage: req.stream_options?.include_usage,
           model, id, last: [],
+          enumTypes,
           shared,
         }))
         .pipeThrough(new TextEncoderStream());
@@ -220,30 +222,131 @@ async function handleCompletions (req, apiKey) {
         console.error("Error parsing response:", err);
         return new Response(body, fixCors(response)); // output as is
       }
-      body = processCompletionsResponse(body, model, id);
+      body = processCompletionsResponse(body, model, id, enumTypes);
     }
   }
   return new Response(body, fixCors(response));
 }
 
-const adjustProps = (schemaPart) => {
-  if (typeof schemaPart !== "object" || schemaPart === null) {
+// Gemini's Schema proto is a closed whitelist: any extra JSON Schema keyword
+// makes it reject the whole request ("Unknown name ... Cannot find field").
+// See https://ai.google.dev/api/caching#Schema
+const SCHEMA_FIELDS = new Set([
+  "type", "format", "title", "description", "nullable", "enum",
+  "maxItems", "minItems", "properties", "required", "items", "anyOf",
+  "propertyOrdering", "default",
+  "minimum", "maximum", "minLength", "maxLength", "pattern", "example",
+]);
+// Strips unsupported keywords from a JSON Schema tree, in place.
+const sanitizeSchema = (schema) => {
+  if (typeof schema !== "object" || schema === null) {
+    return schema;
+  }
+  if (Array.isArray(schema)) {
+    schema.forEach(sanitizeSchema);
+    return schema;
+  }
+  for (const key of Object.keys(schema)) {
+    if (!SCHEMA_FIELDS.has(key)) {
+      delete schema[key];
+    } else if (key === "properties") {
+      Object.values(schema[key]).forEach(sanitizeSchema);
+    } else if (key === "items" || key === "anyOf") {
+      sanitizeSchema(schema[key]);
+    }
+  }
+  return schema;
+};
+// Gemini's Schema.enum is repeated string; any other JSON type is rejected
+// with "Invalid value ... (TYPE_STRING)". The declared values are remembered so
+// the tool arguments can be cast back to the type the client asked for.
+const coerceEnums = (schema, path, types) => {
+  if (Array.isArray(schema)) {
+    schema.forEach((part, i) => coerceEnums(part, `${path}.${i}`, types));
     return;
   }
-  if (Array.isArray(schemaPart)) {
-    schemaPart.forEach(adjustProps);
-  } else {
-    if (schemaPart.type === "object" && schemaPart.properties && schemaPart.additionalProperties === false) {
-      delete schemaPart.additionalProperties;
+  if (!schema || typeof schema !== "object") {
+    return;
+  }
+  if (Array.isArray(schema.enum) && schema.enum.some(value => typeof value !== "string")) {
+    types[path] = schema.type;
+    schema.enum = schema.enum.map(value => String(value));
+  }
+  if (schema.properties) {
+    for (const [key, value] of Object.entries(schema.properties)) {
+      coerceEnums(value, path ? `${path}.${key}` : key, types);
     }
-    Object.values(schemaPart).forEach(adjustProps);
+  }
+  if (schema.items) {
+    coerceEnums(schema.items, `${path}.items`, types);
+  }
+  if (schema.anyOf) {
+    coerceEnums(schema.anyOf, `${path}.anyOf`, types);
   }
 };
-const adjustSchema = (schema) => {
-  const obj = schema[schema.type];
-  delete obj.strict;
-  delete obj.parameters?.$schema;
-  return adjustProps(schema);
+// Reverses coerceEnums on a functionCall argument object.
+const castArgs = (args, types) => {
+  if (!types || !args || typeof args !== "object") {
+    return args;
+  }
+  const walk = (node, path) => {
+    if (Array.isArray(node)) {
+      node.forEach((value, i) => { node[i] = walk(value, `${path}.items`); });
+      return node;
+    }
+    if (!node || typeof node !== "object") {
+      const type = types[path];
+      if (type && typeof node === "string") {
+        if (type === "integer") {
+          const num = Number(node);
+          if (Number.isInteger(num)) { return num; }
+        } else if (type === "number") {
+          const num = Number(node);
+          if (!Number.isNaN(num)) { return num; }
+        } else if (type === "boolean" && (node === "true" || node === "false")) {
+          return node === "true";
+        }
+      }
+      return node;
+    }
+    for (const key of Object.keys(node)) {
+      node[key] = walk(node[key], path ? `${path}.${key}` : key);
+    }
+    return node;
+  };
+  return walk(args, "");
+};
+// Accepts either shape this module passes in:
+//   a tool        { type: "function", function: { name, description, parameters } }
+//   a format     { type: "json_schema", json_schema: { strict, schema } }
+const adjustSchema = (node, enumTypes) => {
+  if (node?.type === "json_schema") {
+    const box = node.json_schema;
+    if (box) {
+      delete box.strict;
+      if (box.schema) {
+        sanitizeSchema(box.schema);
+        coerceEnums(box.schema, "", enumTypes.response ??= {});
+      }
+    }
+    return node;
+  }
+  // "strict" is a sibling of "parameters", not part of the schema, so it would
+  // otherwise be copied straight into the function declaration.
+  const fn = node?.function;
+  delete node.strict;
+  if (fn) {
+    delete fn.strict;
+  }
+  const params = fn?.parameters ?? node?.parameters;
+  if (params) {
+    sanitizeSchema(params);
+    const name = fn?.name ?? node?.name;
+    if (enumTypes && name) {
+      coerceEnums(params, "", enumTypes[name] ??= {});
+    }
+  }
+  return node;
 };
 
 const harmCategory = [
@@ -283,7 +386,7 @@ const thinkingLevelMap = {
   none: "minimal",
   xhigh: "high",
 };
-const transformConfig = (req, isV3) => {
+const transformConfig = (req, isV3, enumTypes) => {
   let cfg = {};
   //if (typeof req.stop === "string") { req.stop = [req.stop]; } // no need
   for (let key in req) {
@@ -295,7 +398,7 @@ const transformConfig = (req, isV3) => {
   if (req.response_format) {
     switch (req.response_format.type) {
       case "json_schema":
-        adjustSchema(req.response_format);
+        adjustSchema(req.response_format, enumTypes);
         cfg.responseSchema = req.response_format.json_schema?.schema;
         if (cfg.responseSchema && "enum" in cfg.responseSchema) {
           cfg.responseMimeType = "text/x.enum";
@@ -499,11 +602,11 @@ const transformMessages = async (messages) => {
   return { system_instruction, contents };
 };
 
-const transformTools = (req) => {
+const transformTools = (req, enumTypes) => {
   let tools, tool_config;
   if (req.tools) {
     const funcs = req.tools.filter(tool => tool.type === "function");
-    funcs.forEach(adjustSchema);
+    funcs.forEach(func => adjustSchema(func, enumTypes));
     tools = [{ function_declarations: funcs.map(schema => schema.function) }];
   }
   if (req.tool_choice) {
@@ -520,11 +623,11 @@ const transformTools = (req) => {
   return { tools, tool_config };
 };
 
-const transformRequest = async (req, isV3) => ({
+const transformRequest = async (req, isV3, enumTypes = {}) => ({
   ...await transformMessages(req.messages),
   safetySettings,
-  generationConfig: transformConfig(req,isV3),
-  ...transformTools(req),
+  generationConfig: transformConfig(req,isV3,enumTypes),
+  ...transformTools(req,enumTypes),
 });
 
 const generateId = () => {
@@ -555,7 +658,7 @@ function transformCandidates (key, cand) {
         type: "function",
         function: {
           name: fc.name,
-          arguments: JSON.stringify(fc.args),
+          arguments: JSON.stringify(castArgs(fc.args, this.enumTypes?.[fc.name])),
         },
         extra_content: thought_signature ? {google: { thought_signature }} : undefined,
       });
@@ -640,10 +743,10 @@ const checkPromptBlock = (choices, promptFeedback, key) => {
   return true;
 };
 
-const processCompletionsResponse = (data, model, id) => {
+const processCompletionsResponse = (data, model, id, enumTypes) => {
   const obj = {
     id: data.responseId ?? id,
-    choices: data.candidates.map(transformCandidates.bind({}, "message")),
+    choices: data.candidates.map(transformCandidates.bind({ enumTypes }, "message")),
     created: Math.floor(Date.now()/1000),
     model: data.modelVersion ?? model,
     //system_fingerprint: "fp_69829325d0",
