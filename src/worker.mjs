@@ -456,14 +456,22 @@ const transformFnResponse = ({ content, tool_call_id }, parts) => {
   if (!parts.calls) {
     throw new HttpError("No function calls found in the previous message", 400);
   }
-  let response;
-  try {
-    response = JSON.parse(content);
-  } catch (err) {
-    console.error("Error parsing function response content:", err);
-    throw new HttpError("Invalid function response: " + content, 400);
+  // OpenAI-compatible clients routinely send plain-text tool results (file
+  // contents, command output). Only treat the content as JSON when it really
+  // parses, otherwise forward the text as { result: text } instead of failing
+  // the whole request.
+  let response = content;
+  if (typeof content === "string") {
+    try {
+      response = JSON.parse(content);
+    } catch {
+      response = { result: content };
+    }
   }
-  if (typeof response !== "object" || response === null || Array.isArray(response)) {
+  if (response === undefined || response === null) {
+    response = { result: "" };
+  }
+  if (typeof response !== "object" || Array.isArray(response)) {
     response = { result: response };
   }
   if (!tool_call_id) {
